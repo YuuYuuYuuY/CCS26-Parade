@@ -9,6 +9,80 @@ import torch
 from .similarity import unpack_128bit_to_binary
 
 
+NEGATIVE_SAMPLING_POLICIES = ("uniform", "exclude_known_positive")
+
+
+class KnownPositiveIndex:
+    """Complete profile-to-AS CSR membership, including every hop and weight."""
+
+    def __init__(self, profile_ids, as_ids, num_profiles, num_asns, device="cpu"):
+        self.num_profiles, self.num_asns = int(num_profiles), int(num_asns)
+        self.device = torch.device(device)
+        pids = torch.as_tensor(profile_ids).to(device="cpu", dtype=torch.long)
+        aids = torch.as_tensor(as_ids).to(device="cpu", dtype=torch.long)
+        keys = pids * self.num_asns + aids
+        if len(keys) > 1 and not bool((keys[1:] > keys[:-1]).all()):
+            keys = torch.unique(keys, sorted=True)
+        self.known_pairs = keys.numel()
+        sorted_pids = torch.div(keys, self.num_asns, rounding_mode="floor")
+        self.counts_cpu = torch.bincount(sorted_pids, minlength=self.num_profiles)
+        self.starts_cpu = self.counts_cpu.cumsum(0) - self.counts_cpu
+        self.counts = self.counts_cpu.to(self.device)
+        self.starts = self.starts_cpu.to(self.device)
+        self.as_ids = keys.remainder(self.num_asns).to(device=self.device, dtype=torch.int32)
+        self._search_steps = int(self.counts_cpu.max()).bit_length()
+
+    @classmethod
+    def from_triplets(cls, triplets, num_profiles, num_asns, device="cpu"):
+        return cls(triplets[:, 0], triplets[:, 1], num_profiles, num_asns, device)
+
+    @torch.no_grad()
+    def contains(self, profile_ids, as_ids):
+        pids, aids = torch.broadcast_tensors(
+            torch.as_tensor(profile_ids, dtype=torch.long, device=self.device),
+            torch.as_tensor(as_ids, dtype=torch.long, device=self.device),
+        )
+        shape = pids.shape
+        pids, aids = pids.reshape(-1), aids.reshape(-1)
+        low = self.starts[pids].clone()
+        ends = low + self.counts[pids]
+        high = ends.clone()
+        for _ in range(self._search_steps):
+            active = low < high
+            middle = (low + high) // 2
+            values = self.as_ids[middle.clamp(max=self.known_pairs - 1)]
+            smaller = active & (values < aids)
+            low = torch.where(smaller, middle + 1, low)
+            high = torch.where(active & ~smaller, middle, high)
+        found = (low < ends) & (self.as_ids[low.clamp(max=self.known_pairs - 1)] == aids)
+        return found.reshape(shape)
+
+    @torch.no_grad()
+    def sample(self, profile_ids, num_samples, generator=None):
+        pids = torch.as_tensor(profile_ids, dtype=torch.long, device=self.device)
+        candidates = torch.randint(self.num_asns, (len(pids), num_samples),
+                                   device=self.device, generator=generator)
+        expanded_pids = pids[:, None].expand_as(candidates)
+        rejected = self.contains(expanded_pids, candidates)
+        flat_candidates = candidates.reshape(-1)
+        positions = torch.nonzero(rejected.reshape(-1), as_tuple=True)[0]
+        while positions.numel():
+            redrawn = torch.randint(self.num_asns, (positions.numel(),),
+                                    device=self.device, generator=generator)
+            flat_candidates[positions] = redrawn
+            positions = positions[self.contains(pids[positions // num_samples], redrawn)]
+        return candidates
+
+
+def sample_negative_as(profile_ids, num_samples, num_asns, *, policy="uniform",
+                       known_positive_index=None, generator=None):
+    """Draw with replacement, rejecting complete known positives when requested."""
+    if policy == "exclude_known_positive":
+        return known_positive_index.sample(profile_ids, num_samples, generator)
+    pids = torch.as_tensor(profile_ids)
+    return torch.randint(num_asns, (len(pids), int(num_samples)), device=pids.device, generator=generator)
+
+
 class CompactSampler:
     def __init__(self, triplets_tensor: torch.Tensor, num_profiles: int, device: torch.device):
         t0 = time.time()
@@ -56,17 +130,10 @@ def load_training_artifacts(data_dir: Path, device: torch.device) -> Dict[str, t
     with open(data_dir / "meta.json", "r", encoding="utf-8") as f:
         meta = json.load(f)
 
-    fp_path = data_dir / "profile_fingerprints.pt"
-    if not fp_path.exists():
-        raise FileNotFoundError(f"Missing {fp_path}")
-
-    raw_fp = torch.load(fp_path, map_location=device)
+    raw_fp = torch.load(data_dir / "profile_fingerprints.pt", map_location=device)
     fingerprints = unpack_128bit_to_binary(raw_fp.to(device))
 
-    triplets_path = data_dir / "profile_triplets.pt"
-    if not triplets_path.exists():
-        raise FileNotFoundError(f"Missing {triplets_path}")
-    triplets = torch.load(triplets_path, map_location="cpu")
+    triplets = torch.load(data_dir / "profile_triplets.pt", map_location="cpu")
 
     return {
         "meta": meta,

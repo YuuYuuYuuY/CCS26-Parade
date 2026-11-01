@@ -20,6 +20,8 @@ def override_from_cli(cfg: Dict[str, Any], args: argparse.Namespace) -> Dict[str
         cfg["paths"]["data_dir"] = args.data_dir
     if args.model_dir is not None:
         cfg["paths"]["model_dir"] = args.model_dir
+    if args.negative_sampling is not None:
+        cfg["train"]["negative_sampling"] = args.negative_sampling
     return cfg
 
 
@@ -31,4 +33,5 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--geometry", type=str, choices=["hyperbolic", "euclidean"], default=None)
     parser.add_argument("--data_dir", type=str, default=None)
     parser.add_argument("--model_dir", type=str, default=None)
+    parser.add_argument("--negative-sampling", choices=["uniform", "exclude_known_positive"])
     return parser

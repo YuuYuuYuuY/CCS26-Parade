@@ -93,19 +93,18 @@ inline bool extract_as_path_info(bgpstream_elem_t* elem, ASPair* pairs, uint8_t&
     bgpstream_as_path_iter_reset(path_iter.get());
     bgpstream_as_path_seg_t* cur_seg = nullptr;
     vector<uint32_t> bound_asns;
-    uint32_t hash_val = 0;
+    bgpstream_as_path_seg_t* previous_seg = nullptr;
 
     cur_seg = bgpstream_as_path_get_next_seg(elem->as_path, path_iter.get());
     if (cur_seg) {
-        hash_val = bgpstream_as_path_seg_hash(cur_seg);
+        previous_seg = cur_seg;
         bound_asns = parse_as_segment(cur_seg, bound_asns, pairs, count);
 
         while ((cur_seg = bgpstream_as_path_get_next_seg(elem->as_path, path_iter.get())) != nullptr) {
-            uint32_t cur_hash = bgpstream_as_path_seg_hash(cur_seg);
-            if (cur_hash == hash_val) {
+            if (bgpstream_as_path_seg_equal(previous_seg, cur_seg)) {
                 continue;
             }
-            hash_val = cur_hash;
+            previous_seg = cur_seg;
             bound_asns = parse_as_segment(cur_seg, bound_asns, pairs, count);
         }
     }

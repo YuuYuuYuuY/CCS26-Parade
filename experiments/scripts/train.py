@@ -13,7 +13,8 @@ if str(ROOT) not in sys.path:
     sys.path.append(str(ROOT))
 
 from experiments.core.config import build_arg_parser, load_json_config, override_from_cli
-from experiments.core.data import CompactSampler, load_training_artifacts
+from experiments.core.data import (CompactSampler, KnownPositiveIndex,
+                                   load_training_artifacts, sample_negative_as)
 from experiments.core.similarity import compute_affinity, recalibrate_affinity
 from experiments.losses.parade_loss import ParadeLoss
 from experiments.models.factory import build_model
@@ -36,6 +37,7 @@ def build_optimizer(model: torch.nn.Module, geometry: str, lr: float, weight_dec
 
 def run_training(cfg: dict) -> None:
     process_start = time.time()
+    negative_sampling = cfg["train"].get("negative_sampling", "uniform")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
@@ -53,11 +55,15 @@ def run_training(cfg: dict) -> None:
     triplets = artifacts["triplets"]
     fingerprints = artifacts["fingerprints"]
 
+    known_positive_index = None
+    if negative_sampling == "exclude_known_positive":
+        print("Indexing complete profile-AS memberships for negative rejection", flush=True)
+        known_positive_index = KnownPositiveIndex.from_triplets(
+            triplets, meta["num_profiles"], meta["num_asns"], device=device)
+
     sampler = CompactSampler(triplets, meta["num_profiles"], device=device)
     valid_profiles = torch.nonzero(sampler.counts > 0).squeeze(1)
     num_train_profiles = valid_profiles.size(0)
-    if num_train_profiles == 0:
-        raise ValueError("Training data contains no profile-AS samples")
 
     model = build_model(
         geometry=cfg["model"]["geometry"],
@@ -89,8 +95,6 @@ def run_training(cfg: dict) -> None:
     epochs = cfg["train"]["epochs"]
     batch_size = cfg["train"]["batch_size"]
     micro_batch_size = int(cfg["train"].get("micro_batch_size", batch_size))
-    if micro_batch_size <= 0 or micro_batch_size > batch_size:
-        raise ValueError("micro_batch_size must be in (0, batch_size]")
     gradient_accumulation_steps = (batch_size + micro_batch_size - 1) // micro_batch_size
     m = cfg["train"]["num_samples_per_profile"]
     sim_weight = cfg["loss"]["sim_weight"]
@@ -145,7 +149,9 @@ def run_training(cfg: dict) -> None:
                 curr_bs = p_idxs_a.size(0)
 
                 pos_as, pos_hops, pos_weights = sampler.sample(p_idxs_a, num_samples=m)
-                neg_as = torch.randint(0, meta["num_asns"], (curr_bs, 3 * m), device=device)
+                neg_as = sample_negative_as(
+                    p_idxs_a, 3 * m, meta["num_asns"], policy=negative_sampling,
+                    known_positive_index=known_positive_index)
 
                 d_pos = model(p_idxs_a, pos_as)
                 d_neg = model(p_idxs_a, neg_as)
@@ -240,14 +246,15 @@ def run_training(cfg: dict) -> None:
             print("Early stopping triggered")
             break
 
-    torch.save(model.state_dict(), model_dir / "final_model.pth")
-
     total_train_time_sec = time.time() - total_train_start
 
     peak_alloc_series = [r["cuda_mem_peak_alloc_mb"] for r in epoch_records if r["cuda_mem_peak_alloc_mb"] is not None]
     peak_reserved_series = [r["cuda_mem_peak_reserved_mb"] for r in epoch_records if r["cuda_mem_peak_reserved_mb"] is not None]
-
     train_metrics = {
+        "negative_sampling": negative_sampling,
+        "device": str(device),
+        "complete_positive_rows": int(triplets.shape[0]),
+        "known_positive_pairs": known_positive_index.known_pairs if known_positive_index is not None else None,
         "seed": seed,
         "geometry": cfg["model"]["geometry"],
         "embed_dim": cfg["model"]["embed_dim"],

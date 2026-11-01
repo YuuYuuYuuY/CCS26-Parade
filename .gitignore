@@ -25,6 +25,7 @@ build/
 bin/
 log/
 experiments/results/
+experiments/cache/
 .pids
 
 # IDE

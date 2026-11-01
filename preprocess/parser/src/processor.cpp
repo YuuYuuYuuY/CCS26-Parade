@@ -21,6 +21,7 @@
 #include <malloc.h>
 #include "helpers.hpp"
 #include "path_extractor.hpp"
+#include "as_path_identity.hpp"
 
 extern "C" {
 #include <bgpstream.h>
@@ -76,18 +77,19 @@ unordered_map<string, int32_t> prefix_to_id;
 vector<string> id_to_prefix;
 
 
-// Path Hash -> ID (Using BGPStream's 32-bit hash combined with origin AS)
-unordered_map<uint64_t, int32_t> path_hash_to_id;
+unordered_map<string, int32_t> path_to_id;
 
 // Optimized Storage: Fixed arrays to avoid fragmentation and allow memcpy 
 struct FixedPath {
     ASPair pairs[AS_PAIR_SIZE];
 };
-vector<FixedPath> id_to_fixed_path;
-vector<uint8_t> id_to_path_len;
-// Retain linear paths for reference_paths.bin; training uses FixedPath.
-vector<vector<uint32_t>> id_to_linear_path;
-vector<uint8_t> id_to_path_is_strict;
+struct PathRecord {
+    FixedPath fixed{};
+    uint8_t pair_count = 0;
+    vector<uint32_t> linear;
+    bool strict = false;
+};
+vector<PathRecord> path_records;
 
 // Packed (prefix_id, path_id) keys are deduplicated by in-place sort/unique
 // to avoid allocating one tree node per route.
@@ -212,6 +214,24 @@ bool is_strict_linear_as_path(bgpstream_as_path_t* path) {
     return true;
 }
 
+int32_t intern_path(bgpstream_elem_t* elem) {
+    string key = exact_as_path_key(elem->as_path);
+    if (key.empty()) return -1;
+    const auto existing = path_to_id.find(key);
+    if (existing != path_to_id.end()) return existing->second;
+    PathRecord record;
+    record.linear = extract_as_path(elem->as_path);
+    if (record.linear.empty()) return -1;
+    if (record.linear.size() > 255)
+        throw length_error("AS_PATH exceeds uint8 reference length and hop format");
+    record.strict = is_strict_linear_as_path(elem->as_path);
+    extract_as_path_pairs(elem, record.fixed, record.pair_count);
+    const int32_t id = path_records.size();
+    path_to_id.emplace(std::move(key), id);
+    path_records.push_back(std::move(record));
+    return id;
+}
+
 void process_entry(const string& prefix_str, const vector<uint32_t>& as_path, PathSource source) {
     if (as_path.empty()) return;
 
@@ -293,37 +313,9 @@ bool process_mrt_file(const string& filepath) {
                 string pfx_str(prefix_str);
                 int32_t p_id = get_or_create_prefix_id(pfx_str);
 
-                uint64_t path_hash = ((uint64_t)origin_as << 32) | bgpstream_as_path_hash(elem->as_path);
-                int32_t path_id;
-                
-                auto hash_it = path_hash_to_id.find(path_hash);
-                if (hash_it != path_hash_to_id.end()) {
-                    path_id = hash_it->second;
-                } else {
-                    FixedPath fp;
-                    uint8_t cnt;
-                    if(extract_as_path_pairs(elem, fp, cnt) == false || cnt == 0) {
-                        continue;
-                    }
-                    path_id = id_to_path_len.size();
-                    id_to_fixed_path.push_back(fp);
-                    id_to_path_len.push_back(cnt);
-                    id_to_linear_path.emplace_back();
-                    id_to_path_is_strict.push_back(0);
-                    path_hash_to_id[path_hash] = path_id;
-                }
-
-                vector<uint32_t> as_path = extract_as_path(elem->as_path);
-                if (!as_path.empty()) {
-                    const bool is_strict = is_strict_linear_as_path(elem->as_path);
-                    if (id_to_linear_path[path_id].empty()) {
-                        id_to_linear_path[path_id] = as_path;
-                    }
-                    if (is_strict) {
-                        id_to_path_is_strict[path_id] = 1;
-                    }
-                    rib_entry_keys.push_back(make_entry_key(p_id, path_id));
-                }
+                const int32_t path_id = intern_path(elem);
+                if (path_id < 0) continue;
+                rib_entry_keys.push_back(make_entry_key(p_id, path_id));
             }
         }
     }
@@ -376,37 +368,9 @@ void process_upd_file(const string& filepath) {
             string pfx_str(prefix_str);
             int32_t p_id = get_or_create_prefix_id(pfx_str);
 
-            uint64_t path_hash = ((uint64_t)origin_as << 32) | bgpstream_as_path_hash(elem->as_path);
-            int32_t path_id;
-
-            auto hash_it = path_hash_to_id.find(path_hash);
-            if (hash_it != path_hash_to_id.end()) {
-                path_id = hash_it->second;
-            } else {
-                FixedPath fp;
-                uint8_t cnt;
-                if (extract_as_path_pairs(elem, fp, cnt) == false || cnt == 0) {
-                    continue;
-                }
-                path_id = id_to_path_len.size();
-                id_to_fixed_path.push_back(fp);
-                id_to_path_len.push_back(cnt);
-                id_to_linear_path.emplace_back();
-                id_to_path_is_strict.push_back(0);
-                path_hash_to_id[path_hash] = path_id;
-            }
-
-            vector<uint32_t> as_path = extract_as_path(elem->as_path);
-            if (!as_path.empty()) {
-                const bool is_strict = is_strict_linear_as_path(elem->as_path);
-                if (id_to_linear_path[path_id].empty()) {
-                    id_to_linear_path[path_id] = as_path;
-                }
-                if (is_strict) {
-                    id_to_path_is_strict[path_id] = 1;
-                }
-                upd_entry_keys.push_back(make_entry_key(p_id, path_id));
-            }
+            const int32_t path_id = intern_path(elem);
+            if (path_id < 0) continue;
+            upd_entry_keys.push_back(make_entry_key(p_id, path_id));
         }
     }
     bgpstream_destroy(bs);
@@ -417,10 +381,10 @@ void materialize_profile_inputs() {
         const auto [prefix_id, path_id] = decode_entry_key(key);
         if (prefix_id < 0 || path_id < 0
                 || static_cast<size_t>(prefix_id) >= id_to_prefix.size()
-                || static_cast<size_t>(path_id) >= id_to_linear_path.size()) {
+                || static_cast<size_t>(path_id) >= path_records.size()) {
             continue;
         }
-        const auto& path = id_to_linear_path[path_id];
+        const auto& path = path_records[path_id].linear;
         if (!path.empty()) {
             process_entry(id_to_prefix[prefix_id], path, PathSource::RIB);
         }
@@ -438,10 +402,10 @@ void materialize_profile_inputs() {
         const auto [prefix_id, path_id] = decode_entry_key(key);
         if (prefix_id < 0 || path_id < 0
                 || static_cast<size_t>(prefix_id) >= id_to_prefix.size()
-                || static_cast<size_t>(path_id) >= id_to_linear_path.size()) {
+                || static_cast<size_t>(path_id) >= path_records.size()) {
             continue;
         }
-        const auto& path = id_to_linear_path[path_id];
+        const auto& path = path_records[path_id].linear;
         if (!path.empty()) {
             process_entry(id_to_prefix[prefix_id], path, PathSource::UPD);
         }
@@ -458,7 +422,7 @@ void write_rib_artifacts(const string& output_dir) {
 
         for (uint64_t key : rib_entry_keys) {
             const auto [prefix_id, path_id] = decode_entry_key(key);
-            const auto& path = id_to_linear_path[path_id];
+            const auto& path = path_records[path_id].linear;
             BGPRecord record;
             memset(&record, 0, sizeof(record));
             record.timestamp = 0;
@@ -479,8 +443,8 @@ void write_rib_artifacts(const string& output_dir) {
                 }
             }
 
-            const auto& fp = id_to_fixed_path[path_id];
-            const uint8_t pair_count = id_to_path_len[path_id];
+            const auto& fp = path_records[path_id].fixed;
+            const uint8_t pair_count = path_records[path_id].pair_count;
             record.as_pair_count = pair_count;
             if (pair_count > 0) {
                 memcpy(record.as_pairs, fp.pairs, pair_count * sizeof(ASPair));
@@ -500,16 +464,18 @@ void write_rib_artifacts(const string& output_dir) {
         for (uint64_t key : rib_entry_keys) {
             const auto [prefix_id, path_id] = decode_entry_key(key);
             (void)prefix_id;
-            const auto& path = id_to_linear_path[path_id];
-            if (id_to_path_is_strict[path_id] && !path.empty() && path.size() <= 255) {
+            const auto& record = path_records[path_id];
+            const auto& path = record.linear;
+            if (record.strict && !path.empty()) {
                 ++count;
             }
         }
         ofs.write(reinterpret_cast<const char*>(&count), sizeof(count));
         for (uint64_t key : rib_entry_keys) {
             const auto [prefix_id, path_id] = decode_entry_key(key);
-            const auto& path = id_to_linear_path[path_id];
-            if (!id_to_path_is_strict[path_id] || path.empty() || path.size() > 255) {
+            const auto& record = path_records[path_id];
+            const auto& path = record.linear;
+            if (!record.strict || path.empty()) {
                 continue;
             }
             const uint8_t path_len = static_cast<uint8_t>(path.size());
@@ -525,11 +491,8 @@ void write_rib_artifacts(const string& output_dir) {
 }
 
 void release_path_storage() {
-    unordered_map<uint64_t, int32_t>().swap(path_hash_to_id);
-    vector<FixedPath>().swap(id_to_fixed_path);
-    vector<uint8_t>().swap(id_to_path_len);
-    vector<vector<uint32_t>>().swap(id_to_linear_path);
-    vector<uint8_t>().swap(id_to_path_is_strict);
+    unordered_map<string, int32_t>().swap(path_to_id);
+    vector<PathRecord>().swap(path_records);
     vector<uint64_t>().swap(rib_entry_keys);
     vector<uint64_t>().swap(upd_entry_keys);
     malloc_trim(0);
@@ -624,7 +587,7 @@ int main(int argc, char* argv[]) {
     
     // Profiles share a sorted (AS_ID, minimum hop) vector.
     map<vector<pair<int32_t, uint8_t>>, int32_t> fingerprint_to_profile_id;
-    vector<int32_t> prefix_to_profile_id(id_to_prefix.size());
+    vector<int32_t> prefix_to_profile_id(id_to_prefix.size(), -1);
     
     struct Triplet {
         int32_t profile_id;
